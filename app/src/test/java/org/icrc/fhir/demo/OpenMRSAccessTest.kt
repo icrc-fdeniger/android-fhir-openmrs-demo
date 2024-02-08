@@ -1,126 +1,97 @@
 package org.icrc.fhir.demo
 
-import ca.uhn.fhir.context.FhirContext
-import ca.uhn.fhir.context.FhirVersionEnum
-import ca.uhn.fhir.parser.ErrorHandlerAdapter
-import ca.uhn.fhir.parser.JsonParser
-import com.google.android.fhir.NetworkConfiguration
-import com.google.android.fhir.sync.HttpAuthenticationMethod
-import com.google.android.fhir.sync.HttpAuthenticator
-import com.google.android.fhir.sync.download.DownloadState
-import com.google.android.fhir.sync.download.Downloader
-import com.google.android.fhir.sync.download.DownloaderImpl
-import com.google.android.fhir.sync.remote.FhirHttpDataSource
-import com.google.android.fhir.sync.remote.FhirHttpService
-import com.google.android.fhir.sync.remote.HttpLogger
-import com.google.android.fhir.sync.remote.RetrofitHttpService
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
+import androidx.work.Data
+import androidx.work.ListenableWorker
+import androidx.work.testing.TestListenableWorkerBuilder
+import com.google.android.fhir.FhirEngine
+import com.google.android.fhir.LocalChange
+import com.google.android.fhir.SearchResult
+import com.google.android.fhir.search.Search
+import com.google.android.fhir.sync.AcceptRemoteConflictResolver
+import com.google.android.fhir.sync.ResourceSyncException
+import com.google.android.fhir.sync.SyncJobStatus
+import com.google.android.fhir.sync.SyncOperation
+import com.google.android.fhir.sync.upload.LocalChangesFetchMode
+import com.google.android.fhir.sync.upload.SyncUploadProgress
+import com.google.android.fhir.sync.upload.UploadSyncResult
+import com.google.common.truth.Truth
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.runBlocking
-import org.hl7.fhir.r4.model.Resource
+import org.apache.commons.lang3.time.DateUtils
+import org.hl7.fhir.r4.model.Patient
+import org.hl7.fhir.r4.model.ResourceType
 import org.junit.Assert
+import org.junit.Assume
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import org.junit.runners.JUnit4
-import java.io.File
-import java.io.FileInputStream
-import java.util.Properties
-
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.util.Date
 
 /**
  * Example local unit test, which will execute on the development machine (host).
  *
  * See [testing documentation](http://d.android.com/tools/testing).
  */
-@RunWith(JUnit4::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest=Config.NONE)
 class OpenMRSAccessTest {
 
     private val logger = KotlinLogging.logger {}
-    private lateinit var retrofitHttpService : FhirHttpService
+    private val context: Context = ApplicationProvider.getApplicationContext();
+    private val fhirEngine: FhirEngine = LoadConnectionInfo.getRetrofitHttpService(context);
 
 
     @Before
-    fun load_variables() {
-        val openmrsFileProperties = File("./openmrs.properties").absoluteFile;
-        if (!openmrsFileProperties.exists()) {
-            Assert.fail("file ${openmrsFileProperties.path} can't be found");
-        }
-        val properties = Properties()
-        FileInputStream(openmrsFileProperties).use {
-            properties.load(it);
-        }
-        val openmrsUser: String = properties.getProperty("openmrsUser", "")
-        val openmrsPwd: String = properties.getProperty("openmrsPwd", "")
-        val openmrsUrl: String = properties.getProperty("openmrsUrl", "")
-        var valid: Boolean = true;
-        if (openmrsUser.isBlank()) {
-            logger.error { "the property openmrsUser is not set in ${openmrsFileProperties.path}" }
-            valid = false;
-        }
-        if (openmrsPwd.isBlank()) {
-            logger.error { "the property openmrsPwd is not set in ${openmrsFileProperties.path}" }
-            valid = false;
-        }
-        if (openmrsUrl.isBlank()) {
-            logger.error { "the property openmrsUrl is not set in ${openmrsFileProperties.path}" }
-            valid = false;
-        }
-        if (!valid) {
-            Assert.fail("Some required properties are not set");
-        } else {
-            logger.info { "Can configure HttpService" }
-        }
-        retrofitHttpService =
-            RetrofitHttpService.builder(
-                openmrsUrl,
-                NetworkConfiguration(uploadWithGzip = false)
+    fun testFhirEngineIsCreated() {
+        Assume.assumeNotNull(fhirEngine);
+    }
+
+
+    /**
+     * in this suppose there is a patient in OpenMRS with  address-city=NAIROBI
+     * See ICRCDownloadManagerImpl
+     * Bug on Windows: https://issuetracker.google.com/issues/203087070
+     */
+    @Test
+    fun testSynchro() {
+        val fhirSyncWorkerData = FhirSyncWorkerData(fhirEngine, ICRCDownloadManagerImpl(), AcceptRemoteConflictResolver)
+        val worker: ICRCFhirSyncWorker =
+            TestListenableWorkerBuilder<ICRCFhirSyncWorker>(
+                context,
+                inputData = Data.Builder().putInt("max_retires", 2).build(),
+                runAttemptCount = 2,
             )
-                .setAuthenticator {
-                    HttpAuthenticationMethod.Basic(
-                        username = openmrsUser,
-                        password = openmrsPwd
-                    )
-                }
-                .setHttpLogger(HttpLogger.NONE)
+                .setWorkerFactory(ICRCWorkerFactory(fhirSyncWorkerData))
                 .build()
 
-    }
-
-
-    @Test
-    fun test_connection_to_openmrs() {
-        val fhirHttpDataSource = FhirHttpDataSource(retrofitHttpService);
-        val downloadWorkManager = ICRCDownloadManagerImpl()
-        val downloader = DownloaderImpl(fhirHttpDataSource, downloadWorkManager)
-        val fhirContext = FhirContext(FhirVersionEnum.R4)
-        val jsonParser = JsonParser(fhirContext, ErrorHandlerAdapter())
-        val extractResources = extractResources(downloader,downloadWorkManager.toString())
-        extractResources.forEach { r -> System.err.println(jsonParser.encodeToString(r)) }
-
-    }
-
-    private fun extractResources(
-        downloader: Downloader, url: String
-    ): List<Resource> {
-        val resources = mutableListOf<Resource>()
-        runBlocking {
-            downloader.download().collect {
-                when (it) {
-                    is DownloadState.Started -> {
-                        logger.debug { "Download started" }
-                    }
-
-                    is DownloadState.Success -> {
-                        resources.addAll(it.resources)
-                    }
-
-                    is DownloadState.Failure -> {
-                        logger.error { "can't download resource $url" }
-                        throw it.syncError.exception
-                    }
-                }
-            };
+        var result: ListenableWorker.Result = runBlocking {
+            logger.info { "start downloading" }
+            worker.doWork()
         }
-        return resources
+        Truth.assertThat(result).isInstanceOf(ListenableWorker.Result.Success()::class.java)
+        val patients: List<SearchResult<Patient>> = runBlocking {
+            fhirEngine.search(Search(ResourceType.Patient))
+        }
+        Assert.assertFalse(patients.isEmpty())
+        val patient = patients[0].resource
+        patient.setLanguage("fr")
+        runBlocking {
+            logger.info { "start updating" }
+            fhirEngine.update(patient)
+        };
+        result = runBlocking {
+            logger.info { "start uploading" }
+            worker.doWork()
+        }
+        if(result is ListenableWorker.Result.Failure){
+            logger.error {"can't upload data" }
+            logger.error { result.outputData }
+        }
+        Truth.assertThat(result).isInstanceOf(ListenableWorker.Result.Success()::class.java)
     }
+
 }
